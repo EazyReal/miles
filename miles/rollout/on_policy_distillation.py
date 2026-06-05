@@ -33,7 +33,12 @@ def _get_reward_weight_mode(args: Namespace) -> str:
     return mode
 
 
-def _score_payload(input_ids: list[int], top_k: int = 0, token_ids: list[int] | None = None) -> dict[str, Any]:
+def _score_payload(
+    input_ids: list[int],
+    top_k: int = 0,
+    token_ids: list[int] | None = None,
+    token_ids_positions: list[list[int]] | None = None,
+) -> dict[str, Any]:
     payload = {
         "input_ids": input_ids,
         "sampling_params": {
@@ -46,9 +51,29 @@ def _score_payload(input_ids: list[int], top_k: int = 0, token_ids: list[int] | 
     }
     if top_k > 0:
         payload["top_logprobs_num"] = top_k
-    if token_ids:
+    if token_ids_positions is not None:
+        # Per-position scoring (patched sglang): one id-list per input position, so the
+        # teacher returns each position's own ids (sparse) instead of the global union
+        # broadcast to every position (dense O(R^2)). Aligned to logprob_start_len=0.
+        payload["token_ids_logprob_positions"] = token_ids_positions
+    elif token_ids:
         payload["token_ids_logprob"] = token_ids
     return payload
+
+
+def _per_position_ids(top_logprobs: TopLogprobs, prompt_len: int) -> list[list[int]]:
+    """Build one token-id list per scored input position for ``token_ids_logprob_positions``.
+
+    ``top_logprobs`` is per response position (length == response_length). Prompt
+    positions are padded with empty id-lists so the layout aligns with
+    ``logprob_start_len=0`` and the existing ``_trim_input_field`` extraction
+    (``values[1:][-response_length:]``) — i.e. response position r lands at index
+    ``prompt_len + r``.
+    """
+    per_pos: list[list[int]] = [[] for _ in range(prompt_len)]
+    for entries in top_logprobs:
+        per_pos.append([_top_entry_token_id(e) for e in (entries or []) if e is not None])
+    return per_pos
 
 
 def _student_score_url(args: Namespace) -> str:
@@ -268,20 +293,33 @@ async def reward_func(args, sample, **kwargs):
 
     strategy = _get_top_k_strategy(args)
     student_top = _student_top_logprobs(sample, sample.response_length)
+    # Per-position scoring requires a patched teacher/student server that understands
+    # token_ids_logprob_positions; default off so an unpatched server keeps working.
+    per_position = getattr(args, "opd_topk_per_position", False)
+    prompt_len = len(sample.tokens) - sample.response_length
 
     teacher_top_k = top_k if strategy != "only_stu" else 0
-    teacher_token_ids = _unique_ids(student_top) if strategy in {"only_stu", "union", "union-intersection"} else None
-    teacher_payload = _score_payload(sample.tokens, top_k=teacher_top_k, token_ids=teacher_token_ids)
+    need_student_ids_on_teacher = strategy in {"only_stu", "union", "union-intersection"}
+    if need_student_ids_on_teacher and per_position:
+        teacher_payload = _score_payload(
+            sample.tokens, top_k=teacher_top_k, token_ids_positions=_per_position_ids(student_top, prompt_len)
+        )
+    elif need_student_ids_on_teacher:
+        teacher_payload = _score_payload(sample.tokens, top_k=teacher_top_k, token_ids=_unique_ids(student_top))
+    else:
+        teacher_payload = _score_payload(sample.tokens, top_k=teacher_top_k)
     teacher_response = await _post_json(args.rm_url, teacher_payload)
 
     reward_payload = {"teacher": teacher_response}
     if strategy in {"only_tch", "union", "union-intersection"}:
         teacher_top = _trim_input_field(teacher_response["meta_info"], "input_top_logprobs", sample.response_length)
-        student_token_ids = _unique_ids(teacher_top)
-        reward_payload["student_on_teacher"] = await _post_json(
-            _student_score_url(args),
-            _score_payload(sample.tokens, token_ids=student_token_ids),
-        )
+        if per_position:
+            student_payload = _score_payload(
+                sample.tokens, token_ids_positions=_per_position_ids(teacher_top, prompt_len)
+            )
+        else:
+            student_payload = _score_payload(sample.tokens, token_ids=_unique_ids(teacher_top))
+        reward_payload["student_on_teacher"] = await _post_json(_student_score_url(args), student_payload)
 
     return reward_payload
 
