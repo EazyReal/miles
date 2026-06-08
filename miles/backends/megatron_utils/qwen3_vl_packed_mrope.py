@@ -23,6 +23,31 @@ _tls = threading.local()
 def install_qwen3_vl_packed_mrope_patch() -> None:
     _patch_rotary_signature()
     _patch_model_forward_and_rope_index()
+    _patch_allgather_vision_embeddings_kwarg()
+
+
+def _patch_allgather_vision_embeddings_kwarg() -> None:
+    """megatron-bridge 0.5.0 calls AllGatherVisionEmbeddings.apply(..., cp_group=...) in the
+    Qwen3-VL vision_dp_when_cp path, but torch.autograd.Function.apply rejects keyword args
+    (TypeError: apply() takes no keyword arguments). Replace the symbol with a shim whose
+    .apply accepts cp_group as a kwarg and forwards it positionally.
+    """
+    try:
+        model_mod = importlib.import_module("megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model")
+    except ImportError:
+        return
+    orig = getattr(model_mod, "AllGatherVisionEmbeddings", None)
+    if orig is None or getattr(orig, "_miles_kwarg_shim", False):
+        return
+
+    class _AllGatherVisionEmbeddingsKwargShim:
+        _miles_kwarg_shim = True
+
+        @staticmethod
+        def apply(input, seqlens_on_cp_ranks, cp_group=None):
+            return orig.apply(input, seqlens_on_cp_ranks, cp_group)
+
+    model_mod.AllGatherVisionEmbeddings = _AllGatherVisionEmbeddingsKwargShim
 
 
 def _patch_rotary_signature() -> None:
