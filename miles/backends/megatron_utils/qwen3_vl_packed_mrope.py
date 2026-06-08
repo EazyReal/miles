@@ -87,31 +87,77 @@ def _patch_model_forward_and_rope_index() -> None:
     setattr(model_mod, _PATCHED, True)
 
 
-def _build_packed_positions(self, args, kwargs, orig_get_rope_index):
-    # Per-segment MRoPE positions for a THD single-row packed batch; else None (run normally).
-    input_ids = kwargs.get("input_ids")
-    if input_ids is None and args:
-        input_ids = args[0]
-    psp = kwargs.get("packed_seq_params")
-    if psp is None or getattr(psp, "qkv_format", None) != "thd":
-        return None
-    if input_ids is None or input_ids.dim() != 2 or input_ids.shape[0] != 1:
-        return None
-    cu_t = getattr(psp, "cu_seqlens_q", None)
-    if cu_t is None or cu_t.numel() < 2:
-        return None
-    flat = input_ids.reshape(-1)
-    cu = cu_t.detach().cpu().tolist()
-    if cu[0] != 0 or cu[-1] != flat.numel():
-        # cu_seqlens_q doesn't describe this local row. Under context parallelism the THD
-        # row is laid out against cu_seqlens_q_padded (load-balanced CP chunks), which this
-        # path does not yet reconstruct, so we fall back to the dense get_rope_index.
-        # TODO(follow-up): per-segment positions for the CP + padded layout.
-        logger.debug(
-            "qwen3_vl packed mRoPE: cu_seqlens_q (%d) != local len (%d); using dense path", cu[-1], flat.numel()
-        )
-        return None
+def _cp_size_rank():
+    """Context-parallel (size, rank); (1, 0) when CP is unavailable."""
+    try:
+        from megatron.core import parallel_state as _ps
 
+        return _ps.get_context_parallel_world_size(), _ps.get_context_parallel_rank()
+    except Exception:
+        return 1, 0
+
+
+def _natural_to_zigzag_slice(t, cp_size, cp_rank, dim):
+    """Slice a full-length tensor into this rank's zigzag (load-balanced ring-attn) CP chunks.
+
+    Mirrors miles.backends.training_utils.cp_utils.slice_with_cp / natural_to_zigzag_slice:
+    rank r owns chunks [r, 2*cp_size-1-r] of the 2*cp_size equal partitions along ``dim``.
+    """
+    total = t.shape[dim]
+    num_chunks = 2 * cp_size
+    chunk = total // num_chunks
+    idxs = [cp_rank, 2 * cp_size - 1 - cp_rank]
+    return torch.cat([t.narrow(dim, i * chunk, chunk) for i in idxs], dim=dim)
+
+
+def _cp_allgather_unzigzag(flat, cu, cp_size):
+    """Reconstruct the full THD packed row from this rank's zigzag chunks.
+
+    Under CP, ``flat`` holds only chunks [cp_rank, 2*cp-1-cp_rank] of every segment, and
+    ``cu`` (== psp.cu_seqlens_q) gives the FULL padded per-segment boundaries. All-gather the
+    per-rank rows over the CP group and de-interleave each segment back to natural order.
+    Returns None (caller falls back to dense) if a segment is not divisible by 2*cp.
+    """
+    import torch.distributed as dist
+    from megatron.core import parallel_state as _ps
+
+    group = _ps.get_context_parallel_group()
+    gathered = [torch.empty_like(flat) for _ in range(cp_size)]
+    dist.all_gather(gathered, flat.contiguous(), group=group)
+    return _reassemble_full_row(gathered, cu, cp_size)
+
+
+def _reassemble_full_row(gathered, cu, cp_size):
+    """De-interleave per-rank zigzag rows back into the full natural-order packed row.
+
+    ``gathered[r]`` is rank r's local row; ``cu`` (full padded per-segment boundaries, i.e.
+    miles' cu_seqlens * cp) locates each segment. For segment ``i`` of full length ``L`` (a
+    multiple of 2*cp), rank r contributed chunk r and chunk 2*cp-1-r, each of size L/(2*cp),
+    at local offset cu[i]//cp. Pure (no collectives) so it is unit-testable. Returns None if a
+    segment is not divisible by 2*cp (caller falls back to the dense path).
+    """
+    full = torch.zeros(cu[-1], dtype=gathered[0].dtype, device=gathered[0].device)
+    for i in range(len(cu) - 1):
+        seg_full = cu[i + 1] - cu[i]
+        if seg_full <= 0:
+            continue
+        if seg_full % (2 * cp_size) != 0:
+            return None
+        c = seg_full // (2 * cp_size)
+        local_off = cu[i] // cp_size  # this segment's offset within a per-rank (local) row
+        for r in range(cp_size):
+            mir = 2 * cp_size - 1 - r
+            full[cu[i] + r * c : cu[i] + (r + 1) * c] = gathered[r][local_off : local_off + c]
+            full[cu[i] + mir * c : cu[i] + (mir + 1) * c] = gathered[r][local_off + c : local_off + 2 * c]
+    return full
+
+
+def _segment_positions(self, flat, cu, cu_t, kwargs, orig_get_rope_index):
+    """Per-segment MRoPE positions for a full (unsharded) packed row `flat` with boundaries `cu`.
+
+    Returns a list of [3, 1, seg_len] tensors (one per non-empty segment), text segments get
+    a linear 0..L range, media segments call get_rope_index with the matching grid slice.
+    """
     image_grid_thw = kwargs.get("image_grid_thw")
     video_grid_thw = kwargs.get("video_grid_thw")
     merge = self.config.spatial_merge_size
@@ -153,7 +199,59 @@ def _build_packed_positions(self, args, kwargs, orig_get_rope_index):
         img_off += ic
         vid_off += vc
         segments.append(pos)
-    return torch.cat(segments, dim=2).contiguous() if segments else None
+    return segments
+
+
+def _build_packed_positions(self, args, kwargs, orig_get_rope_index):
+    # Per-segment MRoPE positions for a THD packed batch; else None (run normally / dense).
+    input_ids = kwargs.get("input_ids")
+    if input_ids is None and args:
+        input_ids = args[0]
+    psp = kwargs.get("packed_seq_params")
+    if psp is None or getattr(psp, "qkv_format", None) != "thd":
+        return None
+    if input_ids is None or input_ids.dim() != 2 or input_ids.shape[0] != 1:
+        return None
+    cu_t = getattr(psp, "cu_seqlens_q", None)
+    if cu_t is None or cu_t.numel() < 2:
+        return None
+    flat = input_ids.reshape(-1)
+    local_len = flat.numel()
+    cu = cu_t.detach().cpu().tolist()
+    if cu[0] != 0:
+        return None
+
+    cp_size, cp_rank = _cp_size_rank()
+
+    # Non-CP (or single chunk): cu_seqlens_q already describes this row exactly.
+    if cu[-1] == local_len:
+        segments = _segment_positions(self, flat, cu, cu_t, kwargs, orig_get_rope_index)
+        return torch.cat(segments, dim=2).contiguous() if segments else None
+
+    # CP + THD packing: cu_seqlens_q gives the FULL padded per-segment boundaries (miles
+    # builds cu_seqlens * cp_size), while this row holds only this rank's zigzag chunks
+    # (full_len / cp). Reconstruct the full row across the CP group, build full per-segment
+    # MRoPE positions, then re-slice each segment into this rank's zigzag layout so the
+    # positions line up with the tokens that slice_with_cp produced.
+    if cp_size > 1 and cu[-1] == cp_size * local_len:
+        full_flat = _cp_allgather_unzigzag(flat, cu, cp_size)
+        if full_flat is None:
+            logger.debug("qwen3_vl packed mRoPE: CP segment not divisible by 2*cp; dense path")
+            return None
+        segments = _segment_positions(self, full_flat, cu, cu_t, kwargs, orig_get_rope_index)
+        if not segments:
+            return None
+        local_segments = [_natural_to_zigzag_slice(p, cp_size, cp_rank, dim=2) for p in segments]
+        return torch.cat(local_segments, dim=2).contiguous()
+
+    # Unrecognized layout -> let the dense get_rope_index run.
+    logger.debug(
+        "qwen3_vl packed mRoPE: cu_seqlens_q (%d) vs local len (%d), cp=%d; dense path",
+        cu[-1],
+        local_len,
+        cp_size,
+    )
+    return None
 
 
 def _slice(grid, offset, count):
