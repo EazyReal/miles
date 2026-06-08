@@ -101,11 +101,6 @@ def get_model_provider_func(
         # Qwen3-VL (and other CP models) assert config.calculate_per_token_loss under CP>1;
         # the bridge builds config from HF so core_transformer_config_from_args never runs.
         provider.calculate_per_token_loss = args.calculate_per_token_loss
-        # Qwen3-VL needs the vision tower processed data-parallel across CP ranks (split +
-        # all-gather of vision embeds) so they line up with the CP-local token mask; the
-        # bridge default is False, which mismatches under CP>1.
-        if args.context_parallel_size > 1 and hasattr(provider, "vision_dp_when_cp"):
-            provider.vision_dp_when_cp = True
         provider.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
         provider.variable_seq_lengths = args.variable_seq_lengths
         if hasattr(args, "moe_token_dispatcher_type"):

@@ -90,6 +90,15 @@ def _patch_model_forward_and_rope_index() -> None:
 
     model_mod.get_rope_index = patched_get_rope_index
 
+    # Under CP, miles pre-shards the THD row (slice_with_cp), but the bridge forward re-shards
+    # internally via preprocess_packed_seqs (it expects the FULL input). When miles already
+    # sharded, make that internal call an identity that returns miles' packed_seq_params (so CP
+    # attention still sees the full cu_seqlens) instead of re-splitting the already-local data.
+    _patch_preprocess_packed_seqs_identity(model_mod)
+    # Override the bridge's no-op vision-embed hook with the CP-local selector.
+    if hasattr(model_mod, "_miles_select_local_vision_embeds"):
+        model_mod._miles_select_local_vision_embeds = select_local_vision_embeds
+
     Qwen3VLModel = getattr(model_mod, "Qwen3VLModel", None)
     if Qwen3VLModel is None or Qwen3VLModel.__dict__.get(_PATCHED, False):
         setattr(model_mod, _PATCHED, True)
@@ -99,17 +108,114 @@ def _patch_model_forward_and_rope_index() -> None:
 
     def patched_forward(self, *args, **kwargs):
         packed = _build_packed_positions(self, args, kwargs, orig_get_rope_index)
-        if packed is None:
-            return orig_forward(self, *args, **kwargs)
-        _tls.packed_positions = packed
+        ctx = _prepare_cp_local_context(self, args, kwargs)
+        if packed is not None:
+            _tls.packed_positions = packed
+        if ctx is not None:
+            _tls.cp_local = ctx
         try:
             return orig_forward(self, *args, **kwargs)
         finally:
             _tls.packed_positions = None
+            _tls.cp_local = None
 
     Qwen3VLModel.forward = patched_forward
     setattr(Qwen3VLModel, _PATCHED, True)
     setattr(model_mod, _PATCHED, True)
+
+
+def _patch_preprocess_packed_seqs_identity(model_mod) -> None:
+    orig = getattr(model_mod, "preprocess_packed_seqs", None)
+    if orig is None or getattr(orig, "_miles_identity_wrapped", False):
+        return
+
+    def wrapped(input_ids, attention_mask, pre_process=True, pg_collection=None):
+        ctx = getattr(_tls, "cp_local", None)
+        if ctx is not None:
+            # already-local CP path: do not re-shard; return the data unchanged together with
+            # miles' full-cu packed_seq_params (callers ignore the psp; the model's CP attention
+            # uses the packed_seq_params passed into forward, which already has the full cu).
+            return input_ids, ctx["psp"]
+        return orig(input_ids, attention_mask, pre_process=pre_process, pg_collection=pg_collection)
+
+    wrapped._miles_identity_wrapped = True
+    model_mod.preprocess_packed_seqs = wrapped
+
+
+def select_local_vision_embeds(embeds):
+    """Select this CP rank's local vision embeddings from the full vision-tower output.
+
+    Called from the (patched) bridge forward at the vision-insertion site: the bridge computes
+    vision_embeds for ALL images (full sequence order) but combined_embeddings here is the
+    CP-local shard, so its vision mask covers only the local image tokens. `_tls.cp_local`
+    carries the indices (into the full vision_embeds) of this rank's local vision tokens, in
+    ascending local-position order (matching boolean-mask assignment).
+    """
+    ctx = getattr(_tls, "cp_local", None)
+    if ctx is None or embeds is None:
+        return embeds
+    idx = ctx["vis_idx"]
+    if idx is None or embeds.shape[0] == idx.shape[0]:
+        return embeds
+    return embeds.index_select(0, idx)
+
+
+def _prepare_cp_local_context(self, args, kwargs):
+    """For the CP + already-sharded THD case, reconstruct the full packed row and precompute the
+    local vision-embed indices so the bridge can scatter the right embeds into the local mask.
+    Returns None for the non-CP / non-packed / full-input cases (bridge runs unchanged)."""
+    input_ids = kwargs.get("input_ids")
+    if input_ids is None and args:
+        input_ids = args[0]
+    psp = kwargs.get("packed_seq_params")
+    if psp is None or getattr(psp, "qkv_format", None) != "thd":
+        return None
+    if input_ids is None or input_ids.dim() != 2 or input_ids.shape[0] != 1:
+        return None
+    cu_t = getattr(psp, "cu_seqlens_q", None)
+    if cu_t is None or cu_t.numel() < 2:
+        return None
+    flat = input_ids.reshape(-1)
+    local_len = flat.numel()
+    cu = cu_t.detach().cpu().tolist()
+    cp_size, cp_rank = _cp_size_rank()
+    if cp_size <= 1 or cu[0] != 0 or cu[-1] != cp_size * local_len:
+        return None  # non-CP or full-input layout: bridge handles it natively
+
+    full = _cp_allgather_unzigzag(flat, cu, cp_size)
+    if full is None:
+        return None
+
+    img_id, vid_id = self.image_token_id, self.video_token_id
+    is_vis_full = (full == img_id) | (full == vid_id)
+    full_vis_pos = torch.nonzero(is_vis_full, as_tuple=False).flatten()  # full vision-token order
+    if full_vis_pos.numel() == 0:
+        vis_idx = None
+    else:
+        local2full = _local_to_full_positions(cu, cp_size, cp_rank, local_len, flat.device)
+        is_vis_local = (flat == img_id) | (flat == vid_id)
+        local_vis_lp = torch.nonzero(is_vis_local, as_tuple=False).flatten()  # ascending local pos
+        local_vis_full_pos = local2full[local_vis_lp]
+        # index of each local vision token within the full vision-token sequence (== vision_embeds order)
+        vis_idx = torch.searchsorted(full_vis_pos, local_vis_full_pos).to(torch.long)
+    return {"psp": psp, "vis_idx": vis_idx}
+
+
+def _local_to_full_positions(cu, cp_size, cp_rank, local_len, device):
+    """Map each local (zigzag) row position to its position in the full natural-order row."""
+    local2full = torch.zeros(local_len, dtype=torch.long, device=device)
+    mir = 2 * cp_size - 1 - cp_rank
+    for i in range(len(cu) - 1):
+        seg_full = cu[i + 1] - cu[i]
+        if seg_full <= 0:
+            continue
+        c = seg_full // (2 * cp_size)
+        local_off = cu[i] // cp_size
+        a0, a1 = cu[i] + cp_rank * c, cu[i] + (cp_rank + 1) * c
+        b0, b1 = cu[i] + mir * c, cu[i] + (mir + 1) * c
+        local2full[local_off : local_off + c] = torch.arange(a0, a1, device=device)
+        local2full[local_off + c : local_off + 2 * c] = torch.arange(b0, b1, device=device)
+    return local2full
 
 
 def _cp_size_rank():
