@@ -13,28 +13,30 @@ on:
 
   workflow_dispatch:
     inputs:
-      variant:
-        description: 'Build variant'
+      cuda:
+        description: 'CUDA build: 130 (13.0) or 129 (12.9)'
         required: true
         type: choice
         options:
-          - primary
-          - cu129-arm64
-          - cu13-arm64
-          - debug
-      image_tag:
-        description: 'Tag mode: latest, dev (rolling + timestamped), or custom'
+          - '130'
+          - '129'
+      arch:
+        description: 'Target arch'
         required: true
         type: choice
         options:
-          - dev
-          - latest
-          - custom
-      custom_tag:
-        description: 'Custom tag name (only used when image_tag is custom)'
+          - x86
+          - aarch64
+      tag:
+        description: "Tag base ('dev' = rolling + timestamped; or 'latest'; or a literal)"
         required: false
-        default: ''
+        default: 'dev'
         type: string
+      test:
+        description: 'Tag with a -test suffix (e.g. dev-test) instead of the plain tag'
+        required: false
+        type: boolean
+        default: false
       dockerfile:
         description: 'Path to Dockerfile (e.g. docker/Dockerfile)'
         required: false
@@ -70,9 +72,9 @@ jobs:
           SGLANG_SHA=$(curl -s -H "Accept: application/vnd.github.sha" \
             "https://api.github.com/repos/sgl-project/sglang/commits/sglang-miles")
 
-          # Check Megatron-LM (main branch)
+          # Check Megatron-LM (miles-main — the branch the image actually builds)
           MEGATRON_SHA=$(curl -s -H "Accept: application/vnd.github.sha" \
-            "https://api.github.com/repos/NVIDIA/Megatron-LM/commits/main")
+            "https://api.github.com/repos/radixark/Megatron-LM/commits/miles-main")
 
           echo "sglang HEAD:   ${SGLANG_SHA}"
           echo "megatron HEAD: ${MEGATRON_SHA}"
@@ -140,10 +142,11 @@ jobs:
       - name: Build and push
         run: |
           python3 docker/build.py \
-            --variant ${{ inputs.variant || 'primary' }} \
-            --image-tag ${{ inputs.image_tag || 'dev' }} \
+            --cuda ${{ inputs.cuda || '130' }} \
+            --arch ${{ inputs.arch || 'x86' }} \
+            --tag ${{ inputs.tag || 'dev' }} \
             --dockerfile ${{ inputs.dockerfile || 'docker/Dockerfile' }} \
-            ${{ inputs.custom_tag && format('--custom-tag {0}', inputs.custom_tag) || '' }} \
+            ${{ inputs.test && '--test' || '' }} \
             --push
 
       - name: Point latest to current dev
