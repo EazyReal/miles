@@ -95,8 +95,7 @@ def _patch_model_forward_and_rope_index() -> None:
     # sharded, make that internal call an identity that returns miles' packed_seq_params (so CP
     # attention still sees the full cu_seqlens) instead of re-splitting the already-local data.
     _patch_preprocess_packed_seqs_identity(model_mod)
-    # The bridge handles CP-pre-sharded vision-embed selection natively
-    # (Qwen3VLModel._cp_local_vision_embed_indices); just verify it is present.
+    # The bridge selects CP-local vision embeds natively; warn when running an old one.
     qwen3vl_model_cls = getattr(model_mod, "Qwen3VLModel", None)
     if qwen3vl_model_cls is not None and not hasattr(qwen3vl_model_cls, "_cp_local_vision_embed_indices"):
         logger.warning(
@@ -138,9 +137,7 @@ def _patch_preprocess_packed_seqs_identity(model_mod) -> None:
     def wrapped(input_ids, attention_mask, *args, **kwargs):
         ctx = getattr(_tls, "cp_local", None)
         if ctx is not None:
-            # already-local CP path: do not re-shard; return the data unchanged together with
-            # miles' full-cu packed_seq_params (callers ignore the psp; the model's CP attention
-            # uses the packed_seq_params passed into forward, which already has the full cu).
+            # Already CP-local: skip re-sharding and hand back miles' full-cu packed_seq_params.
             return input_ids, ctx["psp"]
         return orig(input_ids, attention_mask, *args, **kwargs)
 
