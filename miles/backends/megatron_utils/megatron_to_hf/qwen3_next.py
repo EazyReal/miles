@@ -155,9 +155,8 @@ def convert_qwen3_next_to_hf(args, name, param):
         elif rest == "final_layernorm.weight":
             return [("mtp.norm.weight", param)]
 
-        # MTP transformer-layer components → reuse decoder conversion with mtp prefix.
-        # Megatron-LM renamed the MTP submodule `transformer_layer` -> `mtp_model_layer`;
-        # accept both so this converter works with either Megatron version.
+        # MTP transformer-layer components reuse the decoder conversion with an mtp prefix.
+        # Accept both MTP submodule names: mtp_model_layer (new) and transformer_layer (old).
         for mtp_layer_attr in ("mtp_model_layer.", "transformer_layer."):
             if rest.startswith(mtp_layer_attr):
                 transformer_rest = rest[len(mtp_layer_attr) :]

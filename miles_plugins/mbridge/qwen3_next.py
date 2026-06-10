@@ -130,8 +130,7 @@ class Qwen3NextBridge(Qwen2MoEBridge):
         if name in direct_mappings:
             return [direct_mappings[name]]
 
-        # Megatron-LM renamed the MTP submodule `transformer_layer` -> `mtp_model_layer`;
-        # accept both so this converter works with either Megatron version.
+        # Accept both MTP submodule names: mtp_model_layer (new) and transformer_layer (old).
         for mtp_layer_attr in ("mtp_model_layer", "transformer_layer"):
             if f".{mtp_layer_attr}." not in name:
                 continue

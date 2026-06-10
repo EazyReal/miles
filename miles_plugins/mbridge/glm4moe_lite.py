@@ -130,8 +130,7 @@ class GLM4MoELiteBridge(DeepseekV3Bridge):
         if name in direct_name_mapping:
             return [direct_name_mapping[name]]
 
-        # Megatron-LM renamed the MTP submodule `transformer_layer` -> `mtp_model_layer`;
-        # accept both so this converter works with either Megatron version.
+        # Accept both MTP submodule names: mtp_model_layer (new) and transformer_layer (old).
         for mtp_layer_attr in ("mtp_model_layer", "transformer_layer"):
             if f"mtp.layers.0.{mtp_layer_attr}" in name:
                 proxy_name = name.replace(f"mtp.layers.0.{mtp_layer_attr}", f"decoder.layers.{mtp_layer_id}")

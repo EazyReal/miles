@@ -322,8 +322,7 @@ def _named_params_and_buffers_global(
 
                 # MTP layer indices start from 0
                 layer_idx, rest = match.groups()
-                # Megatron-LM renamed the MTP submodule `transformer_layer` -> `mtp_model_layer`;
-                # match both and re-emit whichever name the running Megatron uses.
+                # Match both MTP submodule names and re-emit whichever the running Megatron uses.
                 expert_pattern = r"(mtp_model_layer|transformer_layer)\.mlp\.experts\.(.+)\.weight(\d+)"
                 match = re.match(expert_pattern, rest)
                 if not match:

@@ -6,8 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-# Megatron-LM renamed the MTP submodule `transformer_layer` -> `mtp_model_layer`;
-# the converters must understand both, so the mapping tests cover both.
+# The converters accept both the old and new MTP submodule names; cover both.
 MTP_LAYER_ATTRS = ("mtp_model_layer", "transformer_layer")
 
 
