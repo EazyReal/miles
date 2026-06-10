@@ -11,10 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from miles.backends.megatron_utils.qwen3_vl_packed_mrope import (
-    _natural_to_zigzag_slice,
-    _reassemble_full_row,
-)
+from miles.backends.megatron_utils.qwen3_vl_packed_mrope import _natural_to_zigzag_slice, _reassemble_full_row
 
 
 def _slice_with_cp(tokens, cp_size, cp_rank, pad_value=0):
