@@ -155,13 +155,17 @@ def convert_qwen3_next_to_hf(args, name, param):
         elif rest == "final_layernorm.weight":
             return [("mtp.norm.weight", param)]
 
-        # mtp_model_layer components → reuse decoder conversion with mtp prefix
-        if rest.startswith("mtp_model_layer."):
-            transformer_rest = rest[len("mtp_model_layer.") :]
-            proxy_name = f"module.module.decoder.layers.{layer_idx}.{transformer_rest}"
-            results = convert_qwen3_next_to_hf(args, proxy_name, param)
-            return [
-                (hf_name.replace(f"model.layers.{layer_idx}", f"mtp.layers.{layer_idx}"), p) for hf_name, p in results
-            ]
+        # MTP transformer-layer components → reuse decoder conversion with mtp prefix.
+        # Megatron-LM renamed the MTP submodule `transformer_layer` -> `mtp_model_layer`;
+        # accept both so this converter works with either Megatron version.
+        for mtp_layer_attr in ("mtp_model_layer.", "transformer_layer."):
+            if rest.startswith(mtp_layer_attr):
+                transformer_rest = rest[len(mtp_layer_attr) :]
+                proxy_name = f"module.module.decoder.layers.{layer_idx}.{transformer_rest}"
+                results = convert_qwen3_next_to_hf(args, proxy_name, param)
+                return [
+                    (hf_name.replace(f"model.layers.{layer_idx}", f"mtp.layers.{layer_idx}"), p)
+                    for hf_name, p in results
+                ]
 
     raise ValueError(f"Unknown parameter name: {name}")

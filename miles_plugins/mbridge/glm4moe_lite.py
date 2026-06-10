@@ -130,8 +130,14 @@ class GLM4MoELiteBridge(DeepseekV3Bridge):
         if name in direct_name_mapping:
             return [direct_name_mapping[name]]
 
-        assert "mtp.layers.0.transformer_layer" in name, "mtp not found"
-        proxy_name = name.replace("mtp.layers.0.transformer_layer", f"decoder.layers.{mtp_layer_id}")
+        # Megatron-LM renamed the MTP submodule `transformer_layer` -> `mtp_model_layer`;
+        # accept both so this converter works with either Megatron version.
+        for mtp_layer_attr in ("mtp_model_layer", "transformer_layer"):
+            if f"mtp.layers.0.{mtp_layer_attr}" in name:
+                proxy_name = name.replace(f"mtp.layers.0.{mtp_layer_attr}", f"decoder.layers.{mtp_layer_id}")
+                break
+        else:
+            raise AssertionError(f"mtp not found in parameter name: {name}")
         if "self_attention" in proxy_name or "input_layernorm.weight" in proxy_name:
             return self._weight_name_mapping_attention(proxy_name)
         if "mlp" in proxy_name:
