@@ -95,15 +95,12 @@ def _patch_model_forward_and_rope_index() -> None:
     # sharded, make that internal call an identity that returns miles' packed_seq_params (so CP
     # attention still sees the full cu_seqlens) instead of re-splitting the already-local data.
     _patch_preprocess_packed_seqs_identity(model_mod)
-    # Override the bridge's identity vision-embed hook with the CP-local selector.
-    # (Older patched bridges exposed the hook under the _miles_-prefixed name.)
-    for hook_name in ("select_cp_local_vision_embeds", "_miles_select_local_vision_embeds"):
-        if hasattr(model_mod, hook_name):
-            setattr(model_mod, hook_name, select_local_vision_embeds)
-            break
-    else:
+    # The bridge handles CP-pre-sharded vision-embed selection natively
+    # (Qwen3VLModel._cp_local_vision_embed_indices); just verify it is present.
+    qwen3vl_model_cls = getattr(model_mod, "Qwen3VLModel", None)
+    if qwen3vl_model_cls is not None and not hasattr(qwen3vl_model_cls, "_cp_local_vision_embed_indices"):
         logger.warning(
-            "megatron-bridge Qwen3-VL model has no select_cp_local_vision_embeds hook; "
+            "megatron-bridge Qwen3VLModel lacks native CP-local vision-embed selection; "
             "CP runs with vision tokens will mis-place vision embeddings. "
             "Apply the matching Megatron-Bridge patch (radixark/Megatron-Bridge PR #9)."
         )
@@ -151,28 +148,11 @@ def _patch_preprocess_packed_seqs_identity(model_mod) -> None:
     model_mod.preprocess_packed_seqs = wrapped
 
 
-def select_local_vision_embeds(embeds):
-    """Select this CP rank's local vision embeddings from the full vision-tower output.
-
-    Called from the (patched) bridge forward at the vision-insertion site: the bridge computes
-    vision_embeds for ALL images (full sequence order) but combined_embeddings here is the
-    CP-local shard, so its vision mask covers only the local image tokens. `_tls.cp_local`
-    carries the indices (into the full vision_embeds) of this rank's local vision tokens, in
-    ascending local-position order (matching boolean-mask assignment).
-    """
-    ctx = getattr(_tls, "cp_local", None)
-    if ctx is None or embeds is None:
-        return embeds
-    idx = ctx["vis_idx"]
-    if idx is None or embeds.shape[0] == idx.shape[0]:
-        return embeds
-    return embeds.index_select(0, idx)
-
-
 def _prepare_cp_local_context(model, args, kwargs):
-    """For the CP + already-sharded THD case, reconstruct the full packed row and precompute the
-    local vision-embed indices so the bridge can scatter the right embeds into the local mask.
-    Returns None for the non-CP / non-packed / full-input cases (bridge runs unchanged)."""
+    """Detect the CP + already-sharded THD case and capture miles' packed_seq_params so the
+    preprocess_packed_seqs identity wrapper can return them unchanged (the bridge handles
+    CP-local vision-embed selection natively). Returns None for the non-CP / non-packed /
+    full-input cases (bridge runs unchanged)."""
     input_ids = kwargs.get("input_ids")
     if input_ids is None and args:
         input_ids = args[0]
@@ -187,44 +167,11 @@ def _prepare_cp_local_context(model, args, kwargs):
     flat = input_ids.reshape(-1)
     local_len = flat.numel()
     cu = cu_t.detach().cpu().tolist()
-    cp_size, cp_rank = _cp_size_rank()
+    cp_size, _ = _cp_size_rank()
     if cp_size <= 1 or cu[0] != 0 or cu[-1] != cp_size * local_len:
         return None  # non-CP or full-input layout: bridge handles it natively
 
-    full = _cp_allgather_unzigzag(flat, cu, cp_size)
-    if full is None:
-        return None
-
-    img_id, vid_id = model.image_token_id, model.video_token_id
-    is_vis_full = (full == img_id) | (full == vid_id)
-    full_vis_pos = torch.nonzero(is_vis_full, as_tuple=False).flatten()  # full vision-token order
-    if full_vis_pos.numel() == 0:
-        vis_idx = None
-    else:
-        local2full = _local_to_full_positions(cu, cp_size, cp_rank, local_len, flat.device)
-        is_vis_local = (flat == img_id) | (flat == vid_id)
-        local_vis_lp = torch.nonzero(is_vis_local, as_tuple=False).flatten()  # ascending local pos
-        local_vis_full_pos = local2full[local_vis_lp]
-        # index of each local vision token within the full vision-token sequence (== vision_embeds order)
-        vis_idx = torch.searchsorted(full_vis_pos, local_vis_full_pos).to(torch.long)
-    return {"psp": psp, "vis_idx": vis_idx}
-
-
-def _local_to_full_positions(cu, cp_size, cp_rank, local_len, device):
-    """Map each local (zigzag) row position to its position in the full natural-order row."""
-    local2full = torch.zeros(local_len, dtype=torch.long, device=device)
-    mir = 2 * cp_size - 1 - cp_rank
-    for i in range(len(cu) - 1):
-        seg_full = cu[i + 1] - cu[i]
-        if seg_full <= 0:
-            continue
-        c = seg_full // (2 * cp_size)
-        local_off = cu[i] // cp_size
-        a0, a1 = cu[i] + cp_rank * c, cu[i] + (cp_rank + 1) * c
-        b0, b1 = cu[i] + mir * c, cu[i] + (mir + 1) * c
-        local2full[local_off : local_off + c] = torch.arange(a0, a1, device=device)
-        local2full[local_off + c : local_off + 2 * c] = torch.arange(b0, b1, device=device)
-    return local2full
+    return {"psp": psp}
 
 
 def _cp_size_rank():
