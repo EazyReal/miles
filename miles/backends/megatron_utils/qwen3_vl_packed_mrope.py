@@ -95,12 +95,15 @@ def _patch_model_forward_and_rope_index() -> None:
     # sharded, make that internal call an identity that returns miles' packed_seq_params (so CP
     # attention still sees the full cu_seqlens) instead of re-splitting the already-local data.
     _patch_preprocess_packed_seqs_identity(model_mod)
-    # Override the bridge's no-op vision-embed hook with the CP-local selector.
-    if hasattr(model_mod, "_miles_select_local_vision_embeds"):
-        model_mod._miles_select_local_vision_embeds = select_local_vision_embeds
+    # Override the bridge's identity vision-embed hook with the CP-local selector.
+    # (Older patched bridges exposed the hook under the _miles_-prefixed name.)
+    for hook_name in ("select_cp_local_vision_embeds", "_miles_select_local_vision_embeds"):
+        if hasattr(model_mod, hook_name):
+            setattr(model_mod, hook_name, select_local_vision_embeds)
+            break
     else:
         logger.warning(
-            "megatron-bridge Qwen3-VL model has no _miles_select_local_vision_embeds hook; "
+            "megatron-bridge Qwen3-VL model has no select_cp_local_vision_embeds hook; "
             "CP runs with vision tokens will mis-place vision embeddings. "
             "Apply the matching Megatron-Bridge patch (radixark/Megatron-Bridge PR #9)."
         )
