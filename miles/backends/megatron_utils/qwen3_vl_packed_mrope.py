@@ -98,6 +98,12 @@ def _patch_model_forward_and_rope_index() -> None:
     # Override the bridge's no-op vision-embed hook with the CP-local selector.
     if hasattr(model_mod, "_miles_select_local_vision_embeds"):
         model_mod._miles_select_local_vision_embeds = select_local_vision_embeds
+    else:
+        logger.warning(
+            "megatron-bridge Qwen3-VL model has no _miles_select_local_vision_embeds hook; "
+            "CP runs with vision tokens will mis-place vision embeddings. "
+            "Apply the matching Megatron-Bridge patch (radixark/Megatron-Bridge PR #9)."
+        )
 
     Qwen3VLModel = getattr(model_mod, "Qwen3VLModel", None)
     if Qwen3VLModel is None or Qwen3VLModel.__dict__.get(_PATCHED, False):
@@ -129,14 +135,14 @@ def _patch_preprocess_packed_seqs_identity(model_mod) -> None:
     if orig is None or getattr(orig, "_miles_identity_wrapped", False):
         return
 
-    def wrapped(input_ids, attention_mask, pre_process=True, pg_collection=None):
+    def wrapped(input_ids, attention_mask, *args, **kwargs):
         ctx = getattr(_tls, "cp_local", None)
         if ctx is not None:
             # already-local CP path: do not re-shard; return the data unchanged together with
             # miles' full-cu packed_seq_params (callers ignore the psp; the model's CP attention
             # uses the packed_seq_params passed into forward, which already has the full cu).
             return input_ids, ctx["psp"]
-        return orig(input_ids, attention_mask, pre_process=pre_process, pg_collection=pg_collection)
+        return orig(input_ids, attention_mask, *args, **kwargs)
 
     wrapped._miles_identity_wrapped = True
     model_mod.preprocess_packed_seqs = wrapped
@@ -160,7 +166,7 @@ def select_local_vision_embeds(embeds):
     return embeds.index_select(0, idx)
 
 
-def _prepare_cp_local_context(self, args, kwargs):
+def _prepare_cp_local_context(model, args, kwargs):
     """For the CP + already-sharded THD case, reconstruct the full packed row and precompute the
     local vision-embed indices so the bridge can scatter the right embeds into the local mask.
     Returns None for the non-CP / non-packed / full-input cases (bridge runs unchanged)."""
@@ -186,7 +192,7 @@ def _prepare_cp_local_context(self, args, kwargs):
     if full is None:
         return None
 
-    img_id, vid_id = self.image_token_id, self.video_token_id
+    img_id, vid_id = model.image_token_id, model.video_token_id
     is_vis_full = (full == img_id) | (full == vid_id)
     full_vis_pos = torch.nonzero(is_vis_full, as_tuple=False).flatten()  # full vision-token order
     if full_vis_pos.numel() == 0:
@@ -283,7 +289,7 @@ def _reassemble_full_row(gathered, cu, cp_size):
     return full
 
 
-def _segment_positions(self, flat, cu, cu_t, kwargs, orig_get_rope_index):
+def _segment_positions(model, flat, cu, cu_t, kwargs, orig_get_rope_index):
     """Per-segment MRoPE positions for a full (unsharded) packed row `flat` with boundaries `cu`.
 
     Returns a list of [3, 1, seg_len] tensors (one per non-empty segment), text segments get
@@ -291,8 +297,8 @@ def _segment_positions(self, flat, cu, cu_t, kwargs, orig_get_rope_index):
     """
     image_grid_thw = kwargs.get("image_grid_thw")
     video_grid_thw = kwargs.get("video_grid_thw")
-    merge = self.config.spatial_merge_size
-    img_id, vid_id, vstart = self.image_token_id, self.video_token_id, self.vision_start_token_id
+    merge = model.config.spatial_merge_size
+    img_id, vid_id, vstart = model.image_token_id, model.video_token_id, model.vision_start_token_id
 
     # Vectorized media count per segment (one GPU->host copy total, no per-segment .item()).
     num_segments = len(cu) - 1
@@ -333,7 +339,7 @@ def _segment_positions(self, flat, cu, cu_t, kwargs, orig_get_rope_index):
     return segments
 
 
-def _build_packed_positions(self, args, kwargs, orig_get_rope_index):
+def _build_packed_positions(model, args, kwargs, orig_get_rope_index):
     # Per-segment MRoPE positions for a THD packed batch; else None (run normally / dense).
     input_ids = kwargs.get("input_ids")
     if input_ids is None and args:
@@ -356,7 +362,7 @@ def _build_packed_positions(self, args, kwargs, orig_get_rope_index):
 
     # Non-CP (or single chunk): cu_seqlens_q already describes this row exactly.
     if cu[-1] == local_len:
-        segments = _segment_positions(self, flat, cu, cu_t, kwargs, orig_get_rope_index)
+        segments = _segment_positions(model, flat, cu, cu_t, kwargs, orig_get_rope_index)
         return torch.cat(segments, dim=2).contiguous() if segments else None
 
     # CP + THD packing: cu_seqlens_q gives the FULL padded per-segment boundaries (miles
@@ -369,7 +375,7 @@ def _build_packed_positions(self, args, kwargs, orig_get_rope_index):
         if full_flat is None:
             logger.debug("qwen3_vl packed mRoPE: CP segment not divisible by 2*cp; dense path")
             return None
-        segments = _segment_positions(self, full_flat, cu, cu_t, kwargs, orig_get_rope_index)
+        segments = _segment_positions(model, full_flat, cu, cu_t, kwargs, orig_get_rope_index)
         if not segments:
             return None
         local_segments = [_natural_to_zigzag_slice(p, cp_size, cp_rank, dim=2) for p in segments]
