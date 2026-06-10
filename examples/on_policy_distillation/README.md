@@ -14,6 +14,10 @@ This directory contains runnable examples:
   Math prompts are scored by a Qwen3-32B teacher and code prompts by a
   Qwen3-Coder-30B-A3B teacher, selected via `--opd-teacher-urls` and a per-row
   `{"metadata": {"opd_teacher": ...}}` tag in the dataset.
+- `run-qwen3-8B-opd-multi-teacher-smoke.sh`: Cheap routing smoke test using two
+  open datasets (DAPO -> teacher A, GSM8K -> teacher B, untagged rows ->
+  `default`). Both teachers serve the student's own weights, so
+  `opd_reverse_kl ~ 0` doubles as a logprob-alignment oracle.
 - `run-qwen3-8B-opd-megatron.sh`: Megatron-loaded teacher OPD.
 
 Use `--opd-log-prob-top-k 0` to run the original sampled-token OPD path.
