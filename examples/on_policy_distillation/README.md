@@ -18,6 +18,11 @@ This directory contains runnable examples:
   open datasets (DAPO -> teacher A, GSM8K -> teacher B, untagged rows ->
   `default`). Both teachers serve the student's own weights, so
   `opd_reverse_kl ~ 0` doubles as a logprob-alignment oracle.
+- `run-qwen3-8B-opd-ensemble.sh`: Teacher-ensemble OPD. Every sample is scored
+  by a weighted group of two teachers in parallel and the targets are combined
+  as a probability-space mixture (`--opd-teacher-urls` with comma-separated
+  URLs and `@weight` suffixes), using the exact tail-bucket top-k KL
+  (`--opd-topk-tail-bucket`).
 - `run-qwen3-8B-opd-megatron.sh`: Megatron-loaded teacher OPD.
 
 Use `--opd-log-prob-top-k 0` to run the original sampled-token OPD path.
