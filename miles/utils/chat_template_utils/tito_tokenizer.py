@@ -182,6 +182,9 @@ class TITOTokenizer:
             raise ValueError(f"rendered suffix diff failed for {roles}")
         prefix_ids = self._encode_text(text_without)
         full_ids = self._encode_text(text_with)
+        if full_ids[: len(prefix_ids)] != prefix_ids:
+            roles = [msg["role"] for msg in appended_messages] if appended_messages else ["generation_prompt"]
+            raise ValueError(f"token-id suffix diff failed for {roles}")
         return full_ids[len(prefix_ids) :]
 
     def tokenize_additional_messages(
