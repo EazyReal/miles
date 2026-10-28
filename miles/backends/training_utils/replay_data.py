@@ -86,7 +86,7 @@ def fill_replay_data(
         cp_size = parallel_state.cp.size
         cp_rank = parallel_state.cp.rank
         if qkv_format == "bshd":
-            # Same padded-length guard as get_batch: max_seq_lens is per-sample.
+            # Same padded-length guard as get_batch: CP geometry is already fixed.
             assert len(set(batch["max_seq_lens"])) == 1, (
                 f"bshd microbatch mixes padded lengths {batch['max_seq_lens']}; "
                 "use 1 sample per microbatch or bucket samples by padded length"

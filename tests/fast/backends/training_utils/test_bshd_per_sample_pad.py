@@ -1,4 +1,4 @@
-"""bshd padded lengths are per-sample, not one rollout-global max; CUDA is stubbed to run on CPU."""
+"""BSHD padding policy and rectangular layout guards; CUDA is stubbed to run on CPU."""
 
 from argparse import Namespace
 from types import SimpleNamespace
@@ -60,9 +60,18 @@ def _patch_state(monkeypatch, state: SimpleNamespace) -> None:
     monkeypatch.setattr(replay_data_mod, "get_parallel_state", lambda: state)
 
 
-def test_rollout_max_seq_lens_are_per_sample(monkeypatch):
-    # Regression: every sample used to be padded to the rollout-global max, so
-    # one 130-token outlier multiplied the short samples' padded lengths.
+@pytest.mark.parametrize(
+    ("mode", "tp_size", "cp_size", "compress_ratios", "expected"),
+    [
+        ("rollout", 1, 1, [], [136, 136, 136]),
+        ("per-sample", 1, 1, [], [8, 136, 24]),
+        ("rollout", 2, 1, [], [144, 144, 144]),
+        ("per-sample", 2, 1, [], [16, 144, 32]),
+        ("rollout", 1, 2, [16], [192, 192, 192]),
+        ("per-sample", 1, 2, [16], [64, 192, 64]),
+    ],
+)
+def test_rollout_padding_policy(monkeypatch, mode, tp_size, cp_size, compress_ratios, expected):
     total_lengths = [7, 130, 24]
     rollout_data = {
         "tokens": [list(range(length)) for length in total_lengths],
@@ -70,25 +79,65 @@ def test_rollout_max_seq_lens_are_per_sample(monkeypatch):
         "total_lengths": list(total_lengths),
         "response_lengths": [max(1, length // 2) for length in total_lengths],
     }
-    _patch_state(monkeypatch, _parallel_state())
+    _patch_state(monkeypatch, _parallel_state(tp_size=tp_size, cp_size=cp_size))
     monkeypatch.setattr(data_mod, "process_rollout_data", lambda *args, **kwargs: (rollout_data, None))
-    args = Namespace(qkv_format="bshd", enable_witness=False, data_pad_size_multiplier=8, compress_ratios=[])
+    args = Namespace(
+        qkv_format="bshd",
+        bshd_padding_mode=mode,
+        enable_witness=False,
+        data_pad_size_multiplier=8,
+        compress_ratios=compress_ratios,
+    )
 
     out, _ = get_rollout_data(args, rollout_data_ref=None)
 
-    assert out["max_seq_lens"] == [8, 136, 24]
+    assert out["max_seq_lens"] == expected
 
 
-def test_get_batch_bshd_accepts_shared_padded_length(monkeypatch):
+@pytest.mark.parametrize(
+    ("mode", "cp_rank", "expected"),
+    [("rollout", 0, [0, 1, 2]), ("rollout", 1, []), ("per-sample", 0, []), ("per-sample", 1, [0, 1, 2])],
+)
+def test_padding_policy_applies_before_response_field_cp_slicing(monkeypatch, mode, cp_rank, expected):
+    rollout_data = {
+        "tokens": [list(range(7)), list(range(130))],
+        "loss_masks": [[1] * 3, [1] * 65],
+        "total_lengths": [7, 130],
+        "response_lengths": [3, 65],
+        **{
+            key: [list(range(3)), list(range(65))]
+            for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl")
+        },
+    }
+    _patch_state(monkeypatch, _parallel_state(cp_size=2, cp_rank=cp_rank))
+    monkeypatch.setattr(data_mod, "process_rollout_data", lambda *args, **kwargs: (rollout_data, None))
+    args = Namespace(
+        qkv_format="bshd",
+        bshd_padding_mode=mode,
+        enable_witness=False,
+        data_pad_size_multiplier=8,
+        compress_ratios=[],
+    )
+
+    out, _ = get_rollout_data(args, rollout_data_ref=None)
+
+    for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl"):
+        assert out[key][0].tolist() == expected
+
+
+@pytest.mark.parametrize(("lengths", "padded_length"), [([7, 8], 8), ([7, 130], 136)])
+def test_get_batch_bshd_accepts_shared_padded_length(monkeypatch, lengths, padded_length):
     _patch_state(monkeypatch, _parallel_state())
 
-    out = get_batch(_FakeIterator(_make_batch([7, 8], [8, 8])), KEYS, pad_multiplier=8, qkv_format="bshd")
+    out = get_batch(
+        _FakeIterator(_make_batch(lengths, [padded_length] * 2)), KEYS, pad_multiplier=8, qkv_format="bshd"
+    )
 
-    assert out["tokens"].shape == (2, 8)
-    assert out["full_loss_masks"].shape == (2, 8)
-    assert torch.equal(out["tokens"][0, :7], torch.arange(1, 8, dtype=torch.long))
-    assert torch.all(out["tokens"][0, 7:] == 0)
-    assert torch.equal(out["tokens"][1], torch.arange(1, 9, dtype=torch.long))
+    assert out["tokens"].shape == (2, padded_length)
+    assert out["full_loss_masks"].shape == (2, padded_length)
+    for i, length in enumerate(lengths):
+        assert torch.equal(out["tokens"][i, :length], torch.arange(1, length + 1, dtype=torch.long))
+        assert torch.all(out["tokens"][i, length:] == 0)
 
 
 def test_get_batch_bshd_rejects_mixed_padded_lengths(monkeypatch):

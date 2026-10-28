@@ -82,15 +82,14 @@ def get_rollout_data(
         if max_compress_ratio:
             local_seqlen_multiple = max_compress_ratio * (2 if parallel_state.cp.size > 1 else 1)
             pad_size = max(pad_size, local_seqlen_multiple * parallel_state.cp.size)
-        # Padding every sample to the rollout max multiplies short samples' token
-        # counts at long context, and pad tokens still dispatch through MoE, so
-        # each sample pads to its own length. Consumers assert that each bshd
-        # microbatch keeps a single padded length.
-        # TODO: compute a per-microbatch max at composition time to support
-        # mixed-length microbatches.
-        rollout_data["max_seq_lens"] = [
-            (length + pad_size - 1) // pad_size * pad_size for length in rollout_data["total_lengths"]
-        ]
+        # Preserve rollout geometry by default: some kernels (e.g. Qwen3.5 GDN)
+        # change numerics with padded length. Per-sample trimming is opt-in.
+        total_lengths = rollout_data["total_lengths"]
+        if args.bshd_padding_mode != "per-sample":
+            total_lengths = [max(total_lengths)] * len(total_lengths)
+        # TODO: per-sample mode needs a shared max at microbatch composition time
+        # to support mixed-length microbatches, before slicing dependent fields.
+        rollout_data["max_seq_lens"] = [(length + pad_size - 1) // pad_size * pad_size for length in total_lengths]
 
     # Full-response SGLang OPD fields share rollout CP slicing but retain float32 precision.
     for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl"):
@@ -179,8 +178,7 @@ def get_batch(
     cp_size = parallel_state.cp.size
 
     if qkv_format == "bshd":
-        # max_seq_lens is per-sample, and build-time CP slicing of the rollout
-        # log probs used each sample's own padded length, so mixing padded
+        # Build-time CP slicing already used max_seq_lens, so mixing padded
         # lengths inside one bshd microbatch would misalign silently.
         assert len(set(batch["max_seq_lens"])) == 1, (
             f"bshd microbatch mixes padded lengths {batch['max_seq_lens']}; "

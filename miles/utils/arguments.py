@@ -274,6 +274,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="The qkv layout.",
             )
             parser.add_argument(
+                "--bshd-padding-mode",
+                choices=["rollout", "per-sample"],
+                default="rollout",
+                help=(
+                    "BSHD padding geometry: 'rollout' preserves the aligned rollout maximum (default); "
+                    "'per-sample' opts into each sample's aligned length to reduce padding. "
+                    "Changing padded length can change backend numerics, including Qwen3.5 Gated DeltaNet; "
+                    "validate log probabilities and gradients on your model/kernel stack before opting in."
+                ),
+            )
+            parser.add_argument(
                 "--linear-attention-backend",
                 type=str,
                 choices=["fla", "flashqla"],
@@ -3521,12 +3532,19 @@ def miles_validate_args(args):
         getattr(args, "sglang_config", None) is not None and getattr(args, "prefill_num_servers", None) is not None
     ), "sglang_config and prefill_num_servers are mutually exclusive. Use server_groups in the YAML config instead."
 
+    assert args.bshd_padding_mode in (
+        "rollout",
+        "per-sample",
+    ), f"Invalid --bshd-padding-mode {args.bshd_padding_mode!r}; expected 'rollout' or 'per-sample'."
+    if args.bshd_padding_mode == "per-sample":
+        assert args.qkv_format == "bshd", "--bshd-padding-mode per-sample requires --qkv-format bshd."
+
     if args.qkv_format == "bshd":
         assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."
         assert (
             args.use_dynamic_batch_size is False
         ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
-        if args.micro_batch_size > 1:
+        if args.bshd_padding_mode == "per-sample" and args.micro_batch_size > 1:
             logger.warning(
                 "bshd with --micro-batch-size > 1 requires every sample in a microbatch to pad to the same "
                 "length; microbatches with multiple padded lengths are rejected during batch preparation. "

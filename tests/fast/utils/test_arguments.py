@@ -323,15 +323,51 @@ class TestRdtValidation:
             self._validate(extra)
 
 
-def test_bshd_multi_sample_microbatch_warns(caplog):
+@pytest.mark.parametrize("mode", ["rollout", "per-sample"])
+def test_bshd_multi_sample_microbatch_warning_is_opt_in(caplog, mode):
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
-    args = parser.parse_args(["--qkv-format", "bshd", "--micro-batch-size", "2", "--num-rollout", "1"] + REQUIRED_ARGS)
+    args = parser.parse_args(
+        ["--qkv-format", "bshd", "--bshd-padding-mode", mode, "--micro-batch-size", "2", "--num-rollout", "1"]
+        + REQUIRED_ARGS
+    )
 
     with caplog.at_level(logging.WARNING, logger="miles.utils.arguments"):
         miles_validate_args(args)
 
-    assert "Use --micro-batch-size 1 unless samples are bucketed by padded length." in caplog.text
+    warning = "Use --micro-batch-size 1 unless samples are bucketed by padded length."
+    assert (warning in caplog.text) == (mode == "per-sample")
+
+
+def test_bshd_padding_defaults_to_rollout_maximum():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(["--qkv-format", "bshd", "--num-rollout", "1"] + REQUIRED_ARGS)
+
+    miles_validate_args(args)
+
+    assert args.bshd_padding_mode == "rollout"
+
+
+def test_per_sample_padding_rejects_thd():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(["--bshd-padding-mode", "per-sample", "--num-rollout", "1"] + REQUIRED_ARGS)
+
+    with pytest.raises(AssertionError, match="requires --qkv-format bshd"):
+        miles_validate_args(args)
+
+
+@pytest.mark.parametrize("mode", [None, "per_sample", "unknown"])
+def test_bshd_padding_rejects_invalid_config_override(mode):
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    args = parser.parse_args(["--qkv-format", "bshd", "--num-rollout", "1"] + REQUIRED_ARGS)
+    # YAML config overrides are applied after argparse has checked its choices.
+    args.bshd_padding_mode = mode
+
+    with pytest.raises(AssertionError, match="Invalid --bshd-padding-mode"):
+        miles_validate_args(args)
 
 
 class TestCriticSaveDerivation:
