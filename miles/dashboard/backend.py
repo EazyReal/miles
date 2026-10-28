@@ -62,7 +62,9 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
                     node_id=ray.get_runtime_context().get_node_id(), soft=False
                 ),
             )
-            .remote(config, prometheus_handle_factory=_prometheus_factory if config.forward_prometheus else None)
+            .remote(
+                config=config, prometheus_handle_factory=_prometheus_factory if config.forward_prometheus else None
+            )
         )
         ray.get(_handle.ping.remote())
         _handle.start.remote()
@@ -166,6 +168,8 @@ def _scalars_only(metrics: dict) -> dict:
     for key, value in metrics.items():
         if isinstance(value, (int, float, str, bool)):
             out[key] = value
-        elif hasattr(type(value), "__float__"):  # numpy/torch zero-dim scalars
+        elif hasattr(
+            type(value), "__float__"
+        ):  # numpy/torch zero-dim scalars  # config-access-exempt: detect numeric scalar conversion without importing array libraries
             out[key] = float(value)
     return out

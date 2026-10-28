@@ -27,6 +27,9 @@ from argparse import Namespace
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+
+from tests.fast.fixtures.args_fixtures import ConfigNamespace
 
 from miles.backends.training_utils.parallel import GroupInfo, ParallelState, set_parallel_state
 
@@ -39,20 +42,23 @@ ARTIFACTS_CACHE = Path.home() / ".cache" / "miles-test-artifacts"
 # ---------------------------------------------------------------------------
 
 
-def make_parallel_state() -> ParallelState:
+def make_parallel_state(is_pp_last_stage: bool = True) -> ParallelState:
     def _trivial_group() -> GroupInfo:
         return GroupInfo(rank=0, size=1, group=None)
 
+    # The fused vocab-parallel CE needs a real group object; use the 1-rank
+    # world group when the test initialized one.
+    tp_group = dist.group.WORLD if dist.is_initialized() else None
     state = ParallelState(
         intra_dp=_trivial_group(),
         intra_dp_cp=_trivial_group(),
         cp=_trivial_group(),
-        tp=_trivial_group(),
-        pp=_trivial_group(),
+        tp=GroupInfo(rank=0, size=1, group=tp_group),
+        pp=_trivial_group() if is_pp_last_stage else GroupInfo(rank=0, size=2, group=None),
         ep=_trivial_group(),
         etp=_trivial_group(),
         indep_dp=_trivial_group(),
-        is_pp_last_stage=True,
+        is_pp_last_stage=is_pp_last_stage,
     )
     set_parallel_state(state)
     return state
@@ -68,10 +74,13 @@ _ARGS_DEFAULTS = dict(
     rollout_temperature=1.0,
     allgather_cp=False,
     log_probs_chunk_size=-1,
+    log_probs_backend="torch",
     true_on_policy_mode=True,
+    debug_unified_grad_fused_logprob=False,
     # compute_advantages_and_returns
     advantage_estimator="grpo",
     use_rollout_logprobs=False,
+    use_sampling_support_replay=False,
     skip_actor_forward_only=False,
     kl_coef=0.1,
     kl_loss_type="k1",
@@ -98,27 +107,41 @@ _ARGS_DEFAULTS = dict(
     custom_pg_loss_reducer_function_path=None,
     use_opsm=False,
     opsm_delta=0.1,
-    calculate_per_token_loss=False,
+    eps_clip_c=None,
+    dump_details=None,
+    multi_lora=False,
+    custom_loss_function_path=None,
     # value_loss_function
     value_clip=0.2,
     # loss_function dispatcher
-    global_batch_size=1,  # overridden by make_inputs
     use_dynamic_global_batch_size=False,
     recompute_loss_function=False,
 )
 
 
+# fields a trainer reads from its backend namespace, kept flat in the stored snapshot args
+_BACKEND_ARGS_DEFAULTS = dict(
+    bf16=False,
+    fp16=False,
+    calculate_per_token_loss=False,
+    vocab_size=None,
+    global_batch_size=1,  # overridden by make_inputs
+)
+
+
 def make_args(**overrides) -> Namespace:
-    d = {**_ARGS_DEFAULTS, **overrides}
-    return Namespace(**d)
+    return args_from_dict(overrides)
 
 
 def args_to_dict(args: Namespace) -> dict:
-    return vars(args)
+    flat = {name: value for name, value in vars(args).items() if name not in {"backend", "train_backend"}}
+    return flat | vars(args.backend)
 
 
 def args_from_dict(d: dict) -> Namespace:
-    return Namespace(**{**_ARGS_DEFAULTS, **d})
+    values = {**_ARGS_DEFAULTS, **_BACKEND_ARGS_DEFAULTS, **d}
+    backend = {name: values.pop(name) for name in _BACKEND_ARGS_DEFAULTS}
+    return ConfigNamespace(**values, train_backend="megatron", backend=Namespace(**backend))
 
 
 # ---------------------------------------------------------------------------

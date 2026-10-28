@@ -1,6 +1,7 @@
-import { getMeta } from "./api.js";
+import { getMeta, refreshMeta } from "./api.js";
 import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
+import { renderSandboxes } from "./views_sandboxes.js";
 import { renderTimeline } from "./views_timeline.js";
 import { renderTokens } from "./views_tokens.js";
 
@@ -46,11 +47,26 @@ function parseRoute() {
   if (segments[0] === "timeline") {
     return { view: "timeline", lanes: params.get("lanes") };
   }
+  if (segments[0] === "sandboxes") {
+    return { view: "sandboxes", staleMinutes: params.get("stale_min") };
+  }
   if (segments[0] === "rollout" && segments.length >= 2) {
-    const rolloutId = Number(segments[1]);
     const evaluation = params.get("eval") === "1";
+    // "latest" is resolved against the dump at render time rather than baked
+    // into the link, because the newest step is often listed before it is
+    // readable; a typed step number is always honoured exactly
+    if (segments[1] === "latest") {
+      return { view: "rollout", rolloutId: null, evaluation };
+    }
+    const rolloutId = Number(segments[1]);
     if (segments[2] === "sample" && segments.length === 4) {
-      return { view: "tokens", rolloutId, sampleIndex: Number(segments[3]), evaluation };
+      return {
+        view: "tokens",
+        rolloutId,
+        sampleIndex: Number(segments[3]),
+        sampleOccurrence: Number(params.get("occurrence") || 0),
+        evaluation,
+      };
     }
     return { view: "rollout", rolloutId, evaluation };
   }
@@ -58,18 +74,26 @@ function parseRoute() {
 }
 
 function crumbs(route, meta) {
-  const nav = (label, href, active) => el("a", { class: `nav${active ? " active" : ""}`, href }, [label]);
+  const nav = (label, href, active, onclick = null) =>
+    el("a", { class: `nav${active ? " active" : ""}`, href, onclick }, [label]);
   const parts = [nav("Metrics", "#/", route.view === "metrics")];
   if (meta.capabilities.has_timeline) {
     parts.push(nav("Compute Utilization", "#/timeline", route.view === "timeline"));
   }
   // the per-step data view is a top-level destination, not a hidden
-  // click-through from chart points; land on the newest train step
-  const latest = meta.rollout_ids.train.at(-1);
-  if (latest !== undefined) {
-    parts.push(nav("Rollouts", `#/rollout/${latest}`, route.view === "rollout" || route.view === "tokens"));
+  // click-through from chart points; land on the newest usable train step
+  if (meta.rollout_ids.train.length) {
+    const onRollout = route.view === "rollout" || route.view === "tokens";
+    const replaceInPlace = (event) => {
+      event.preventDefault();
+      location.replace("#/rollout/latest");
+    };
+    parts.push(nav("Rollouts", "#/rollout/latest", onRollout, onRollout ? replaceInPlace : null));
   }
-  if (route.view === "rollout" || route.view === "tokens") {
+  if (meta.capabilities.has_sandboxes) {
+    parts.push(nav("Sandboxes", "#/sandboxes", route.view === "sandboxes"));
+  }
+  if ((route.view === "rollout" || route.view === "tokens") && route.rolloutId !== null) {
     const evalSuffix = route.evaluation ? "?eval=1" : "";
     parts.push(
       el("span", { class: "crumb" }, [
@@ -81,7 +105,8 @@ function crumbs(route, meta) {
     );
   }
   if (route.view === "tokens") {
-    parts.push(el("span", { class: "crumb" }, [`› sample ${route.sampleIndex}`]));
+    const occurrence = route.sampleOccurrence ? ` · leaf ${route.sampleOccurrence + 1}` : "";
+    parts.push(el("span", { class: "crumb" }, [`› sample ${route.sampleIndex}${occurrence}`]));
   }
   document.getElementById("crumbs").replaceChildren(...parts);
 }
@@ -110,11 +135,32 @@ async function render() {
     if (route.view === "metrics") await renderMetrics(view, meta);
     else if (route.view === "timeline") await renderTimeline(view, meta, route);
     else if (route.view === "rollout") await renderRollout(view, meta, route);
+    else if (route.view === "sandboxes") await renderSandboxes(view, meta, route);
     else await renderTokens(view, meta, route);
   } catch (err) {
     view.replaceChildren(el("div", { class: "error" }, [String(err)]));
   }
 }
 
+// a live run's first sandbox may report after the page has loaded:
+// poll until it does, then show the Sandboxes tab
+const SANDBOX_TAB_POLL_MS = 10000;
+
+async function showSandboxTabOnceReported() {
+  try {
+    const meta = await getMeta();
+    if (meta.mode !== "follow" || meta.capabilities.has_sandboxes) return;
+    const fresh = await refreshMeta();
+    if (fresh.capabilities.has_sandboxes) {
+      crumbs(parseRoute(), fresh);
+      return;
+    }
+  } catch (err) {
+    // the server may be restarting; try again on the next tick
+  }
+  setTimeout(showSandboxTabOnceReported, SANDBOX_TAB_POLL_MS);
+}
+
 window.addEventListener("hashchange", render);
 render();
+showSandboxTabOnceReported();

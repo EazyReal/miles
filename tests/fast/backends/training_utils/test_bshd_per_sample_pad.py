@@ -1,23 +1,29 @@
 """BSHD padding policy and rectangular layout guards; CUDA is stubbed to run on CPU."""
 
 from argparse import Namespace
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-import miles.backends.training_utils.cp_utils as cp_utils_mod
-import miles.backends.training_utils.data as data_mod
-import miles.backends.training_utils.replay_data as replay_data_mod
-from miles.backends.training_utils.data import get_batch, get_rollout_data
-from miles.backends.training_utils.replay_data import fill_replay_data
+from miles.backends.training_utils.data import context_parallel as cp_utils_mod
+from miles.backends.training_utils.data import rollout as data_mod
+from miles.backends.training_utils.data.rollout import get_batch, get_rollout_data
+from miles.backends.training_utils.parallel import GroupInfo, ParallelState
+from miles.backends.training_utils.replay import data as replay_data_mod
+from miles.backends.training_utils.replay.data import fill_replay_data
 
 
-def _parallel_state(cp_rank: int = 0, cp_size: int = 1, tp_size: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(
-        cp=SimpleNamespace(rank=cp_rank, size=cp_size),
-        tp=SimpleNamespace(rank=0, size=tp_size),
-        effective_dp=SimpleNamespace(rank=0, size=1),
+def _parallel_state(cp_rank: int = 0, cp_size: int = 1, tp_size: int = 1) -> ParallelState:
+    trivial = GroupInfo(rank=0, size=1, group=None)
+    return ParallelState(
+        cp=GroupInfo(rank=cp_rank, size=cp_size, group=None),
+        tp=GroupInfo(rank=0, size=tp_size, group=None),
+        intra_dp=trivial,
+        intra_dp_cp=GroupInfo(rank=cp_rank, size=cp_size, group=None),
+        pp=trivial,
+        ep=trivial,
+        etp=trivial,
+        indep_dp=trivial,
     )
 
 
@@ -49,12 +55,11 @@ def _make_batch(lengths: list[int], max_seq_lens: list[int]) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _stub_cuda(monkeypatch):
-    monkeypatch.setattr(torch.Tensor, "cuda", lambda self, *args, **kwargs: self, raising=False)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu", raising=False)
+def _stub_device(monkeypatch):
+    monkeypatch.setattr(data_mod.current_platform, "current_device", lambda: torch.device("cpu"))
 
 
-def _patch_state(monkeypatch, state: SimpleNamespace) -> None:
+def _patch_state(monkeypatch, state: ParallelState) -> None:
     monkeypatch.setattr(data_mod, "get_parallel_state", lambda: state)
     monkeypatch.setattr(cp_utils_mod, "get_parallel_state", lambda: state)
     monkeypatch.setattr(replay_data_mod, "get_parallel_state", lambda: state)
@@ -79,17 +84,22 @@ def test_rollout_padding_policy(monkeypatch, mode, tp_size, cp_size, compress_ra
         "total_lengths": list(total_lengths),
         "response_lengths": [max(1, length // 2) for length in total_lengths],
     }
-    _patch_state(monkeypatch, _parallel_state(tp_size=tp_size, cp_size=cp_size))
+    state = _parallel_state(tp_size=tp_size, cp_size=cp_size)
+    _patch_state(monkeypatch, state)
     monkeypatch.setattr(data_mod, "process_rollout_data", lambda *args, **kwargs: (rollout_data, None))
     args = Namespace(
         qkv_format="bshd",
         bshd_padding_mode=mode,
         enable_witness=False,
         data_pad_size_multiplier=8,
-        compress_ratios=compress_ratios,
+        backend=Namespace(compress_ratios=compress_ratios),
     )
 
-    out, _ = get_rollout_data(args, rollout_data_ref=None)
+    out, _ = get_rollout_data(
+        args,
+        rollout_data_ref=None,
+        train_parallel_config=state.train_parallel_config(supports_precomputed_schedule=True),
+    )
 
     assert out["max_seq_lens"] == expected
 
@@ -109,17 +119,23 @@ def test_padding_policy_applies_before_response_field_cp_slicing(monkeypatch, mo
             for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl")
         },
     }
-    _patch_state(monkeypatch, _parallel_state(cp_size=2, cp_rank=cp_rank))
+    state = _parallel_state(cp_size=2, cp_rank=cp_rank)
+    _patch_state(monkeypatch, state)
     monkeypatch.setattr(data_mod, "process_rollout_data", lambda *args, **kwargs: (rollout_data, None))
     args = Namespace(
         qkv_format="bshd",
         bshd_padding_mode=mode,
         enable_witness=False,
         data_pad_size_multiplier=8,
-        compress_ratios=[],
+        backend=Namespace(compress_ratios=[]),
+        true_on_policy_mode=False,
     )
 
-    out, _ = get_rollout_data(args, rollout_data_ref=None)
+    out, _ = get_rollout_data(
+        args,
+        rollout_data_ref=None,
+        train_parallel_config=state.train_parallel_config(supports_precomputed_schedule=True),
+    )
 
     for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl"):
         assert out[key][0].tolist() == expected
@@ -134,7 +150,7 @@ def test_get_batch_bshd_accepts_shared_padded_length(monkeypatch, lengths, padde
     )
 
     assert out["tokens"].shape == (2, padded_length)
-    assert out["full_loss_masks"].shape == (2, padded_length)
+    assert out["input_loss_masks"].shape == (2, padded_length)
     for i, length in enumerate(lengths):
         assert torch.equal(out["tokens"][i, :length], torch.arange(1, length + 1, dtype=torch.long))
         assert torch.all(out["tokens"][i, length:] == 0)

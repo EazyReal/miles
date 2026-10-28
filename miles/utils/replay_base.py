@@ -4,6 +4,8 @@ import os
 import torch
 import torch.distributed as dist
 
+from miles.platforms import current_platform
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,12 +36,12 @@ class Replay:
             )
         top_indices = self.top_indices_list[self.forward_index]
         self.forward_index += 1
-        return top_indices.to(torch.cuda.current_device())
+        return top_indices.to(current_platform.current_device())
 
     def pop_backward(self) -> torch.Tensor:
         top_indices = self.top_indices_list[self.backward_index]
         self.backward_index += 1
-        return top_indices.to(torch.cuda.current_device())
+        return top_indices.to(current_platform.current_device())
 
     def clear(self):
         self.forward_index = 0
@@ -57,6 +59,9 @@ class BaseReplayManager:
     # True when replayed indices are token/KV positions (indexer): rebase the
     # per-sample 0-based rollout indices onto the packed training sequence.
     replay_indices_are_token_positions = False
+    # True when a train-data dump keeps the rollout column replay consumed. Only R3 is
+    # kept: indexer top-k takes about 0.5 MB per token on DeepSeek-V3.2.
+    kept_in_train_dump = False
 
     def __init__(self):
         self.replays: list[Replay] = []
@@ -191,11 +196,15 @@ class BaseReplayManager:
         is_mismatch = (overlap < required) & ~is_padding
 
         mismatch_count = is_mismatch.sum().item()
+        threshold = float(os.environ.get("MILES_TEST_R3_THRESHOLD", self.replay_check_max_mismatch_fraction))
+        mismatch_threshold = threshold * orig_flat.shape[0]
+        logger.info(
+            f"Replay check (rank {_get_rank()}, stage {self.stage}): "
+            f"mismatch {mismatch_count}/{orig_flat.shape[0]} tokens, threshold {mismatch_threshold:.0f}"
+        )
         if mismatch_count == 0:
             return
 
-        threshold = float(os.environ.get("MILES_TEST_R3_THRESHOLD", self.replay_check_max_mismatch_fraction))
-        mismatch_threshold = threshold * orig_flat.shape[0]
         mismatch_indices = is_mismatch.nonzero(as_tuple=False).squeeze(1)
         for idx in mismatch_indices[:10]:
             i = idx.item()
@@ -219,6 +228,7 @@ class RoutingReplayManager(BaseReplayManager):
     if_sp_region = True
     enable_check_replay_result = False
     replay_check_max_mismatch_fraction = 1e-2
+    kept_in_train_dump = True
 
 
 class IndexerReplayManager(BaseReplayManager):

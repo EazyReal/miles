@@ -6,16 +6,13 @@ from typing import Any
 
 from miles.rollout.generate_utils.generate_endpoint_utils import compute_routing_headers, policy_uses_routing_key
 from miles.utils.http_utils import post
-from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
-from miles.utils.multi_lora import slot_lora_name
+from miles.utils.lora.utils import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.processing_utils import encode_image_for_rollout_engine
 from miles.utils.types import Sample
 
 
 def _lora_path_for_sample(args: Any, sample: Sample) -> str | None:
-    """Adapter name to score under: the sample slot's __miles_slot_{N} name, the fixed single-LoRA name, or None."""
-    if sample.adapter is not None:
-        return slot_lora_name(sample.adapter.slot)
+    """Adapter name to score under: the fixed single-LoRA name, or None."""
     if lora_rollout_enabled(args):
         return LORA_ADAPTER_NAME
     return None
@@ -120,7 +117,7 @@ async def recompute_rollout_logprobs_via_prefill(
     sampling_params: Mapping[str, Any],
     headers: Mapping[str, str] | None = None,
 ) -> None:
-    if not getattr(args, "recompute_logprobs_via_prefill", False):
+    if not args.recompute_logprobs_via_prefill:
         return
     if sample.response_length == 0:
         sample.rollout_log_probs = []
@@ -141,7 +138,7 @@ async def recompute_samples_rollout_logprobs_via_prefill(
     url: str,
     sampling_params: Mapping[str, Any],
 ) -> None:
-    if not getattr(args, "recompute_logprobs_via_prefill", False):
+    if not args.recompute_logprobs_via_prefill:
         return
 
     samples_to_score = [
